@@ -7,6 +7,19 @@
 #     "xmltodict",
 # ]
 # ///
+#
+# SAP Automation Agent - 多线程版本
+# 功能特性:
+#   - 线程池并发处理请求 (ThreadPoolExecutor)
+#   - 线程安全的会话凭据管理
+#   - 连接池和自动重试机制
+#   - 资源自动清理
+#
+# 环境变量配置:
+#   SAP_MAX_WORKERS: 最大并发线程数 (默认: 100)
+#   SAP_REQUEST_TIMEOUT: 请求超时时间/秒 (默认: 300)
+#   SAP_USER: 默认 SAP 用户名
+#   SAP_PASSWORD: 默认 SAP 密码
 
 import os
 import requests
@@ -17,6 +30,8 @@ from pydantic import Field
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
+import atexit
+import weakref
 
 # ==============================================================================
 # Configuration
@@ -123,6 +138,10 @@ mcp = FastMCP("SAP Automation Agent")
 # 全局线程池，用于处理并发请求
 _thread_pool = ThreadPoolExecutor(max_workers=SAPConfig.MAX_WORKERS)
 
+# 用于跟踪所有创建的 Session 对象（使用弱引用避免内存泄漏）
+_active_sessions = weakref.WeakSet()
+_sessions_lock = threading.Lock()
+
 class SAPClient:
     # 为每个线程创建独立的 Session 对象，提高性能
     _thread_local = threading.local()
@@ -141,16 +160,34 @@ class SAPClient:
     def _get_session(cls) -> requests.Session:
         """获取线程本地的 Session 对象（线程安全）"""
         if not hasattr(cls._thread_local, 'session'):
-            cls._thread_local.session = requests.Session()
+            session = requests.Session()
             # 配置连接池
             adapter = requests.adapters.HTTPAdapter(
                 pool_connections=10,
                 pool_maxsize=20,
                 max_retries=3
             )
-            cls._thread_local.session.mount('https://', adapter)
-            cls._thread_local.session.mount('http://', adapter)
+            session.mount('https://', adapter)
+            session.mount('http://', adapter)
+            
+            cls._thread_local.session = session
+            
+            # 记录 Session 对象用于后续清理
+            with _sessions_lock:
+                _active_sessions.add(session)
+                
         return cls._thread_local.session
+    
+    @classmethod
+    def cleanup_thread_session(cls):
+        """清理当前线程的 Session 对象"""
+        if hasattr(cls._thread_local, 'session'):
+            try:
+                cls._thread_local.session.close()
+            except:
+                pass
+            finally:
+                delattr(cls._thread_local, 'session')
 
     def post_soap(self, body_content: str) -> str:
         """发送 SOAP 请求（线程安全）"""
@@ -552,6 +589,89 @@ def get_thread_pool_status() -> str:
     return json.dumps(status, ensure_ascii=False, indent=2)
 
 # ==============================================================================
+# 资源清理
+# ==============================================================================
+
+def cleanup_resources():
+    """清理所有资源：关闭 Session 和线程池"""
+    print("\n正在清理资源...")
+    
+    # 1. 关闭所有活跃的 Session 对象
+    closed_count = 0
+    with _sessions_lock:
+        sessions_to_close = list(_active_sessions)
+    
+    for session in sessions_to_close:
+        try:
+            session.close()
+            closed_count += 1
+        except:
+            pass
+    
+    if closed_count > 0:
+        print(f"  ✓ 已关闭 {closed_count} 个 HTTP Session")
+    
+    # 2. 关闭线程池
+    try:
+        _thread_pool.shutdown(wait=True, cancel_futures=False)
+        print(f"  ✓ 已关闭线程池（{SAPConfig.MAX_WORKERS} 个工作线程）")
+    except:
+        pass
+    
+    print("资源清理完成！\n")
+
+# 注册退出时的清理函数
+atexit.register(cleanup_resources)
+
+@mcp.tool()
+def force_cleanup_resources(ctx: Context = None) -> str:
+    """手动触发资源清理
+    
+    注意：这会关闭所有 HTTP 连接和线程池，之后的请求可能会失败
+    
+    返回:
+        清理结果
+    """
+    try:
+        cleanup_resources()
+        return "资源清理成功"
+    except Exception as e:
+        return f"资源清理时发生错误: {str(e)}"
+
+@mcp.tool()
+def get_resource_stats(ctx: Context = None) -> str:
+    """获取当前资源使用统计
+    
+    返回:
+        资源使用情况的 JSON 数据
+    """
+    import json
+    
+    with _sessions_lock:
+        active_sessions_count = len(_active_sessions)
+    
+    stats = {
+        "thread_pool": {
+            "max_workers": SAPConfig.MAX_WORKERS,
+            "type": "ThreadPoolExecutor"
+        },
+        "http_sessions": {
+            "active_count": active_sessions_count,
+            "description": "每个工作线程一个 Session，自动重用连接"
+        },
+        "connection_pool": {
+            "per_session_connections": 10,
+            "per_session_max_size": 20,
+            "retry_attempts": 3
+        },
+        "timeout": {
+            "request_timeout_seconds": SAPConfig.REQUEST_TIMEOUT
+        }
+    }
+    
+    return json.dumps(stats, ensure_ascii=False, indent=2)
+
+# ==============================================================================
 # 服务器启动
 # ==============================================================================
 
@@ -568,11 +688,23 @@ if __name__ == "__main__":
     print("=" * 60)
     print()
     print("环境变量配置:")
-    print("  SAP_MAX_WORKERS: 设置最大并发线程数 (默认: 10)")
-    print("  SAP_REQUEST_TIMEOUT: 设置请求超时时间/秒 (默认: 30)")
+    print("  SAP_MAX_WORKERS: 设置最大并发线程数 (默认: 100)")
+    print("  SAP_REQUEST_TIMEOUT: 设置请求超时时间/秒 (默认: 300)")
     print("  SAP_USER: 设置默认 SAP 用户名")
     print("  SAP_PASSWORD: 设置默认 SAP 密码")
     print("=" * 60)
     print()
+    print("资源管理:")
+    print("  • 线程池在程序生命周期内保持活跃")
+    print("  • 每个线程复用 HTTP Session 和连接")
+    print("  • 程序退出时自动清理所有资源")
+    print("=" * 60)
+    print()
     
-    mcp.run()
+    try:
+        mcp.run()
+    except KeyboardInterrupt:
+        print("\n\n收到中断信号，正在退出...")
+    finally:
+        # cleanup_resources 会通过 atexit 自动调用
+        pass
